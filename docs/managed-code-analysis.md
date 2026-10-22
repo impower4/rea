@@ -81,13 +81,92 @@ including the existing `inspect-analysis-view` CLI. Session record lifetime and
 export/import semantics remain unchanged. A server without Evidence retention
 rejects selected summary before analysis; complete delivery remains available.
 
+### Member summary and retained member rows
+
+Complete `inspect_managed_members` delivery always includes the assembly-wide
+`member_refs` and `exported_types`, which `type_names` does not narrow, so even
+one selected or unmatched type can return megabytes. In MCP, select
+`{"path":"/absolute/path/Assembly.dll","type_names":["Namespace.Type"],"detail":"summary"}`
+to keep the complete source in the session and receive identity, metadata
+status, the selection with its unmatched names, coverage/issues, the separate
+user-string coverage, limitations and per-collection counts. Then page original
+rows with view kind `managed-members`:
+
+```json
+{
+  "source": {
+    "kind": "retained-evidence",
+    "evidence_id": "<parent_evidence_id>"
+  },
+  "view": {
+    "kind": "managed-members",
+    "collection": "call_edges",
+    "offset": 0,
+    "limit": 64
+  }
+}
+```
+
+Collections are `types`, `exported_types`, `fields`, `methods`, `member_refs`,
+`call_edges`, `field_accesses` and `user_strings` (the literals). Each page names
+its collection, retains original rows, order, tokens, signatures and body facts,
+and carries the source selection and coverage; `user_strings` pages carry the
+literal pool's own coverage. Older Evidence that never examined exported types
+or user strings reports a null count and refuses those pages rather than
+returning an empty one.
+
+#### CLI summary and saved member rows
+
+The CLI accepts the same `complete` and `summary` detail choices. Omitted or
+`--detail complete` returns complete Evidence. To receive a summary, choose a
+new Evidence bundle destination so its original complete parent remains
+available after the command exits:
+
+```bash
+rea inspect-managed-members /absolute/path/Assembly.dll --type Namespace.Type \
+  --detail summary --evidence-bundle /absolute/path/evidence/members.json --json
+```
+
+`--evidence-bundle` writes the complete original Evidence in REA's canonical
+bundle format. Its parent directory must exist, and it never replaces an
+existing path. Relative paths resolve against the command's working directory.
+The option also works with complete delivery when a saved bundle is useful.
+Summary without a destination is rejected before analysis. A publication failure
+returns a typed error with the completed Evidence under
+`details.partial_observation`; it does not report successful summary delivery.
+Cancellation before publication prevents the new output. Once atomic
+publication has started, it can complete despite cancellation; a cancelled
+delivery then retains the committed path and byte count under
+`details.diagnostics.evidence_bundle`.
+
+Copy `normalized_result.parent_evidence_id` from the summary into the
+`source.evidence_id` field of the `managed-members` request above, then save that
+small request as `members-page.json` and run:
+
+```bash
+rea inspect-analysis-view /absolute/path/evidence/members-page.json \
+  --evidence-bundle /absolute/path/evidence/members.json --json
+```
+
+The view command authenticates the selected bundle and resolves that exact
+parent ID. It does not reopen the assembly, so the original target may have
+been moved or removed. Subsequent calls can select another collection or use
+the returned `coverage.next_offset` to continue the same collection. An inline
+source already includes its parent and cannot also select `--evidence-bundle`.
+
+Summary changes delivery, while type selection still controls decoding and the
+same inspection resource limits apply. Each separate CLI page reads and
+authenticates the saved bundle; the full source is retained on disk.
+
 ## Shipped scope
 
 The canonical parser admits PE/CLI bytes and their metadata/CIL without loading
 an assembly. It reports observed implementation markers and unavailable facts;
-it does not unpack .NET single-file hosts, decode IL2CPP metadata, or infer a
-NativeAOT identity from an ordinary native PE. Inputs without admitted CLI
-metadata do not become managed assemblies through naming or routing guesses.
+it does not unpack .NET single-file hosts or infer a NativeAOT identity from an
+ordinary native PE. It does not decode IL2CPP; use
+[IL2CPP metadata](il2cpp-metadata.md) for the image, type and method names in a
+Unity `global-metadata.dat`. Inputs without admitted CLI metadata do not
+become managed assemblies through naming or routing guesses.
 Inspect separately obtained components explicitly and preserve their identities.
 
 A valid implementation marker establishes a candidate native boundary, not
@@ -133,7 +212,14 @@ MCP uses `inspect_managed_members` with
 Repeat `--type` or supply multiple unique `type_names` for several types.
 Names match the reported `full_name` exactly. Top-level names are namespace
 qualified; nested types currently report bare names, which can select several
-types with that name.
+types with that name. Each type's `enclosing_type_token` records its enclosing
+TypeDef. `nesting_read` distinguishes complete source rows (true), incomplete
+current rows (false), and historical Evidence (null). A null enclosing token
+alone does not establish that a type is top-level.
+Each selected type also retains `name_sha256`, a framed digest of its namespace,
+name and enclosing names. It uses the same bounded, cached owner as signature
+type operands and remains available when selection omits the enclosing types.
+It adds one fixed-size digest per returned type rather than repeated name paths.
 
 The result preserves the requested names in `selection.type_names` and reports
 unmatched names separately. If metadata names are unreadable, limitations retain
@@ -209,9 +295,16 @@ native/runtime questions retain their own authority and coverage.
 Names and semantic labels do not establish durable member identity. Comparison
 preserves observed differences, structural inferences, and unknowns separately.
 
-Cross-version matching first pairs members of the same declared type and name:
-methods by exact CIL/signature identity, then by raw signature, then by
-structural body shape; fields by raw signature. Exact CIL/signature identity
+Cross-version matching first pairs members of the same declared type and name.
+A current declared type uses its observed `name_sha256`, so same-named nested
+types in different enclosing types stay distinct even in selected inventories.
+Malformed, missing, contradictory, cyclic or over-deep enclosing identity remains unknown;
+the comparison preserves display names without using them to repair that gap.
+Historical observations retain an explicitly limited bare-name mode when either
+side predates the identity facts. A known current identity gap still remains
+unknown beside a historical observation. Matching then pairs
+methods by exact CIL/signature identity, then by signature, then by
+structural body shape; fields by signature. Exact CIL/signature identity
 requires equal raw CIL digests and decoded fingerprints. Equal decoded
 fingerprints alone cannot establish an exact match: they omit switch targets
 and collapse distinct NaN encodings. Only then may a remap pair a
@@ -219,23 +312,56 @@ renamed or moved member across declared types or names: a method by exact
 CIL/signature identity or structural body shape, a field by exact decoded
 signature. A remap never takes a member whose own declared type and name remain
 unpaired on the other side, so a member is never taken from its own changed
-counterpart. A member whose declaring type is unresolved could belong to any
-type, so it pairs by name only when no other member shares its exact
-CIL/signature key, never by structural shape alone, and any remap group it
-joins stays ambiguous. The exact-signature key uses names only as part of that
+counterpart. A member whose declared identity is unresolved could belong to any type. It
+never makes a declared-identity pair, and any remap group it joins stays
+ambiguous. Unresolved same-named counterparts prevent definitive added/removed
+claims, while observed names and tokens remain available in the result.
+The exact-signature key uses names only as part of that
 full tuple; names alone never select a pair. Duplicate tuples remain ambiguous
-rather than being paired by token order. The raw signature is exact whether or
+rather than being paired by token order. Every round compares signatures by
+`resolved_sha256`: the raw signature with each TypeDef or TypeRef operand
+replaced by a digest of that type's namespace and name, hashed as separate
+values so `A` + `B.C` differs from `A.B` + `C`, after its enclosing types for a
+nested type (`Outer/Inner`). The defining assembly is not part of the name:
+a TypeDef and a TypeRef with the same namespace and name compare as the
+same nominal name, and a TypeRef's ResolutionScope assembly is ignored, so a type
+forwarded from one assembly to another still pairs. Two different types with
+the same full name in different assemblies therefore have equal name digests.
+Comparison reports this scope limitation inline; it does not establish CLR
+type identity or runtime binding equivalence.
+Nesting deeper than 64 levels is not named, and such a signature compares by
+its raw digest. Comparison keys keep resolved and raw digests apart, so a raw
+digest never pairs with an equal resolved one.
+Raw signature bytes name types by metadata row, and rows are build-local, so
+the same signature usually has different raw bytes in two builds. A signature
+that names no types resolves to its raw digest. When an operand cannot be
+resolved, such as a TypeSpec, or when REA could not parse the signature, the
+raw digest stands in. Missing or unreadable TypeDef and TypeRef operands are
+reported as coverage issues. Invalid NestedClass rows retain their failure
+reasons and withhold TypeDef signature identities; type names and nesting are
+parsed once by their shared owner. Each current inspection records
+`signature_resolution: "type-names-v1"`, even when none of its operands can be
+resolved. Historical Evidence defaults this attestation to `null`. When either
+observation predates resolution, both sides compare raw digests, which pair only where type rows agree,
+and the comparison reports that limitation. The signature is exact whether or
 not REA decoded it, so undecoded signatures pair by that tuple too, but they
 never enter structural rounds. An unmatched member is therefore reported as
 `unknown`, not added or removed, when its own signature was not decoded or when
 the other side has an unpaired member, one-sided or ambiguous, with the same
-declared type and name whose signature was not decoded.
+declared type and name whose signature was not decoded. When both observations
+attest type-name resolution, a decoded signature that still compares by its raw
+digest is treated the same way: an unmatched member with one, or beside an
+unpaired same-named member with one, is `unknown`, because its raw bytes name
+types by build-local row. A matched unresolved signature also remains unknown
+unless another observed dimension establishes a change; identical row bytes
+can reference different TypeSpec contents. Its resolution limitation is retained
+even when another dimension changes.
 
 For a matched method, an unavailable or partial body makes body-shape facets
 unknown while preserving observed signature differences. For complete bodies,
 a difference in either the raw CIL digest or the decoded fingerprint is reported
 in the `cil` dimension, including reordered switch targets with equal decoded
-fingerprints. Structural identity compares normalized signatures, the limited
+fingerprints. Structural identity compares resolved signatures, the limited
 decoded-CIL tuple fingerprint,
 constants, and bounded shape context. It reports all candidates at the winning
 score and remains ambiguous when the evidence does not distinguish them. The
@@ -271,7 +397,7 @@ install it or its toolchain. The [NativeAOT guide](ghidra-nativeaot.md) defines
 these routes, their layout/host restrictions, derived-memory provenance, and
 verification coverage.
 
-REA's experimental Windows Ghidra boundary admits native x86 and x86-64 PE
+REA's experimental Windows Ghidra boundary admits native x86, x86-64, ARMNT (Thumb-2) and ARM64 PE
 applications and DLLs for static analysis. For x64 PE NativeAOT, the read-only
 parser also runs there; the [NativeAOT guide](ghidra-nativeaot.md) lists what a
 Windows host covers.
@@ -289,6 +415,9 @@ function implements a specific managed method.
 `verify_managed_native_boundaries` compares declared P/Invoke module and entry
 point identities with supplied native export or function evidence. Name/module
 matches establish declaration links; they do not establish that a call executed.
+When either side lacks a usable module identity, a matching name remains
+unresolved and retains the candidate evidence; REA reports a module mismatch
+only when both identities are available and differ.
 
 Metadata tokens are not native addresses. Native body mapping for C++/CLI,
 ReadyToRun, NativeAOT, and IL2CPP requires separately verified format and provider
@@ -298,6 +427,32 @@ support. The managed static tools do not recover those mappings. The optional
 Declared import inventory supports a bounded positive claim. Its absence does
 not exclude dynamic resolution, generated code, protected code, native helpers,
 or server-side behavior.
+
+## Application graph relations
+
+`project_managed_application_graph` turns member Evidence into `contains`
+edges for declarations, `imports` edges for P/Invoke declarations, and two
+relation kinds read from method bodies:
+
+- `calls` links two `managed-method` nodes when a `call`, `callvirt`, `newobj`
+  or `jmp` site in the caller targets a MethodDef in the inspected module.
+- `accesses` links a `managed-method` node to a `managed-field` node for each
+  field it loads, stores or takes the address of.
+
+Each edge stands for every site between one source and one target. Its
+properties carry `site_count` and per-opcode `opcodes` counts; `accesses`
+edges also list `access` as `read`, `write` and/or `address`. Edge evidence
+links the member Evidence.
+
+Some sites are counted rather than projected: calls to MemberRefs (members of
+other assemblies or of generic type instantiations), generic method
+instantiations (`MethodSpec`), unknown targets, `ldftn`/`ldvirtftn` function
+pointer loads, recursive self-calls (the graph has no self-loops), MemberRef
+fields, and sites whose method or field node is absent, for example under a
+type selection. Limitations name each counted class, and graph coverage is
+`partial` with `omitted_count` equal to the omitted sites when nothing else is
+incomplete. A missing `calls` edge is therefore not evidence that a method is
+never called.
 
 ## Evidence record shape
 
@@ -326,8 +481,9 @@ these indirections for member ownership and local attribute-constructor types;
 field and method tokens still identify the original definition rows.
 `field_list` and `method_list` retain the metadata's list coordinates, which
 refer to the pointer table when present rather than necessarily contiguous
-definition rows. Malformed or ambiguous pointers leave the owner unknown with
-partial coverage while preserving readable member and attribute facts.
+definition rows. Invalid or nonmonotonic list coordinates and malformed or
+ambiguous pointers leave affected owners unknown with partial coverage while
+preserving readable member and attribute facts.
 The retained inverse indexes are admitted against the existing representation
 budget before allocation.
 
@@ -535,6 +691,9 @@ which managed methods executed or how the CLR resolved them.
 
 Managed member comparisons report a `metadata` dimension when an observed
 MethodDef flags or implementation flags value differs, including accessibility
-or synchronization changes. This is separate from the CIL/signature matching
-tiers: identical instructions do not establish unchanged method metadata. The
-reported difference is static metadata evidence, not proof of runtime behavior.
+or synchronization changes. Observed method-body `init_locals` and `max_stack`
+differences also contribute to `metadata`, even when CIL decoding is incomplete.
+An unavailable header value keeps body coverage unknown rather than establishing
+equality or a difference. These comparisons are separate from the CIL/signature
+matching tiers: identical instructions do not establish unchanged method metadata.
+The reported difference is static metadata evidence, not proof of runtime behavior.

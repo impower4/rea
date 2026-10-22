@@ -1,7 +1,6 @@
 import { deflateSync, inflateSync } from "node:zlib";
 import { z } from "zod";
 import {
-  RUST_AUDITABLE_FORMAT_VERSION,
   cyclicDependencyIndices,
   type RustAuditableMetadata,
   type RustPackage,
@@ -24,15 +23,14 @@ const packageSchema = z.strictObject({
   version: z.string().min(1),
   source: z.string().min(1),
   kind: z.enum(["runtime", "build"]).optional(),
-  dependencies: z.array(z.number().int().nonnegative()).optional(),
+  dependencies: z.array(z.int().nonnegative()).optional(),
   root: z.boolean().optional(),
 });
 const documentVersionSchema = z.object({
-  format: z.number().int().nonnegative().optional(),
+  format: z.int().nonnegative().max(0xffff_ffff).optional(),
 });
 const documentSchema = documentVersionSchema
   .extend({
-    format: z.literal(RUST_AUDITABLE_FORMAT_VERSION).optional(),
     packages: z.array(packageSchema),
   })
   .strict();
@@ -238,14 +236,6 @@ const parseDocument = (bytes: Buffer): z.infer<typeof documentSchema> => {
       "malformed",
       "Dependency JSON does not match the format schema",
       { cause: version.error },
-    );
-  if (
-    version.data.format !== undefined &&
-    version.data.format !== RUST_AUDITABLE_FORMAT_VERSION
-  )
-    throw new RustAuditableFormatFailure(
-      "unsupported",
-      `Unsupported cargo-auditable format version ${version.data.format}`,
     );
   admitGraphExpansion(value);
   // One malformed package must fail before Zod retains an issue for every field.

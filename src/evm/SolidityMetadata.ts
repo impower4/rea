@@ -36,11 +36,14 @@ class BoundedMetadataTokenizer extends Tokenizer {
         "CBOR tags and floating-point values are outside this metadata profile.",
       );
     if (Type.equals(token.type, Type.string)) {
-      if (token.byteValue === undefined)
+      if (token.byteValue !== undefined)
+        token.value = utf8.decode(token.byteValue);
+      // cborg answers the shortest-form empty text (0x60) with a shared token that has no
+      // bytes; it can only mean "", which is already its value.
+      else if (token.value !== "" || token.encodedLength !== 1)
         throw new Error(
           "CBOR text bytes were unavailable for strict UTF-8 validation.",
         );
-      token.value = utf8.decode(token.byteValue);
     }
     const parent = this.remaining.length - 1;
     if (parent >= 0) this.remaining[parent]!--;
@@ -119,8 +122,21 @@ export const inspectSolidityMetadata = (
     });
     if (!(raw instanceof Map))
       throw new Error("Terminal CBOR candidate did not decode to a root map.");
-    for (const [key, value] of raw as Map<unknown, unknown>)
-      result.entries.push({ key: scalar(key), value: scalar(value) });
+    // cborg compares Map keys by identity, so repeated byte-string keys (each
+    // its own Uint8Array) pass its duplicate check; compare scalars by value.
+    const seen = new Set<string>();
+    for (const [key, value] of raw as Map<unknown, unknown>) {
+      const entry = { key: scalar(key), value: scalar(value) };
+      if (entry.key.kind !== "uninterpreted") {
+        const identity = JSON.stringify(entry.key);
+        if (seen.has(identity))
+          throw new Error(
+            `CBOR decode error: found repeat map key ${identity}`,
+          );
+        seen.add(identity);
+      }
+      result.entries.push(entry);
+    }
     result.status = result.entries.some(
       ({ key, value }) =>
         key.kind === "uninterpreted" || value.kind === "uninterpreted",

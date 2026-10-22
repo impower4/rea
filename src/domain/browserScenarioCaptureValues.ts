@@ -14,7 +14,7 @@ import { digestSchema } from "./../domain/digests.js";
 const textArtifactSchema = z
   .strictObject({
     sha256: digestSchema,
-    bytes: z.number().int().min(0),
+    bytes: z.int().min(0),
     text: z.string(),
   })
   .superRefine((artifact, context) => {
@@ -39,14 +39,14 @@ export const captureStateSchema = <Schema extends z.ZodType>(value: Schema) =>
     }),
     z.strictObject({
       state: z.literal("truncated"),
-      observed: z.number().int().min(0),
-      retained: z.number().int().min(0),
+      observed: z.int().min(0),
+      retained: z.int().min(0),
       reason: z.string().min(1),
     }),
   ]);
 
 const historySchema = z.strictObject({
-  length: z.number().int().min(0),
+  length: z.int().min(0),
   current_url: sanitizedBrowserUrlSchema,
   navigation_entries: z.array(
     z.strictObject({
@@ -135,8 +135,8 @@ export type BrowserScenarioEventFamily = z.infer<
 >;
 
 const eventBase = {
-  sequence: z.number().int().min(1),
-  step_index: z.number().int().min(0),
+  sequence: z.int().min(1),
+  step_index: z.int().min(0),
 };
 
 const eventUrl = sanitizedBrowserUrlSchema.nullable();
@@ -155,7 +155,7 @@ const webSocketFrameShape = {
   ...eventBase,
   kind: z.enum(["websocket-frame-sent", "websocket-frame-received"]),
   url: sanitizedBrowserUrlSchema,
-  payload_bytes: z.number().int().min(0),
+  payload_bytes: z.int().min(0),
   truncated: z.boolean(),
 };
 
@@ -183,7 +183,7 @@ export const browserScenarioEventSchema = z
     z.strictObject({
       ...networkEventShape,
       kind: z.literal("response"),
-      status: z.number().int().min(100).max(599),
+      status: z.int().min(100).max(599),
       failure: z.null(),
     }),
     z.strictObject({
@@ -209,7 +209,7 @@ export const browserScenarioEventSchema = z
       ...eventBase,
       kind: z.literal("network-content"),
       transaction_id: z.string().min(1),
-      source_event_sequence: z.number().int().min(1),
+      source_event_sequence: z.int().min(1),
       phase: z.enum(["request", "response"]),
       headers: browserNetworkHeadersSchema,
       body: browserNetworkBodySchema,
@@ -279,6 +279,74 @@ const completenessSectionSchema = z.enum([
   "popups",
   "websockets",
 ]);
+
+export const browserScenarioEventKindSchema = z.enum([
+  "console",
+  "page-error",
+  "request",
+  "response",
+  "request-failed",
+  "request-finished",
+  "request-unfinished",
+  "network-content",
+  "websocket-opened",
+  "websocket-closed",
+  "websocket-frame-sent",
+  "websocket-frame-received",
+  "frame-attached",
+  "frame-detached",
+  "frame-navigated",
+  "worker-created",
+  "worker-closed",
+  "popup-opened",
+  "popup-closed",
+  "download-cancelled",
+]);
+export const browserScenarioEventBudgetReasonSchema = z.enum([
+  "max-events",
+  "max-event-allocation-bytes",
+  "max-total-event-allocation-bytes",
+  "max-network-transactions",
+  "max-network-metadata-allocation-bytes",
+  "max-listener-owners",
+]);
+export const browserScenarioEventOmissionsSchema = z.strictObject({
+  by_kind: z.array(
+    z.strictObject({
+      kind: browserScenarioEventKindSchema,
+      count: z.int().positive(),
+      reasons: z.array(browserScenarioEventBudgetReasonSchema).min(1),
+    }),
+  ),
+  network_transactions: z.array(
+    z.strictObject({
+      transaction_id: z.string().min(1),
+      omitted_kinds: z.array(browserScenarioEventKindSchema).min(1),
+      reasons: z.array(browserScenarioEventBudgetReasonSchema).min(1),
+    }),
+  ),
+  network_transaction_range: z
+    .strictObject({
+      first_transaction_id: z.string().min(1),
+      last_transaction_id: z.string().min(1),
+      count: z.int().positive(),
+      reason: z.literal("max-network-transactions"),
+    })
+    .nullable(),
+});
+export type BrowserScenarioEventOmissions = z.infer<
+  typeof browserScenarioEventOmissionsSchema
+>;
+export type BrowserScenarioEventBudgetReason = z.infer<
+  typeof browserScenarioEventBudgetReasonSchema
+>;
+export type BrowserScenarioEventAdmission =
+  | { readonly status: "retained"; readonly sequence: number }
+  | {
+      readonly status: "omitted";
+      readonly sequence: number;
+      readonly reason: BrowserScenarioEventBudgetReason;
+    };
 export type BrowserScenarioCompletenessSection = z.infer<
   typeof completenessSectionSchema
 >;
@@ -340,14 +408,14 @@ export const classifyBrowserScenarioCompleteness = (
 };
 
 const browserScenarioStepShape = {
-  step_index: z.number().int().min(0),
+  step_index: z.int().min(0),
   step_id: z.string().min(1),
   action: z.string().min(1),
-  elapsed_ms: z.number().int().min(0),
+  elapsed_ms: z.int().min(0),
   before_url: sanitizedBrowserUrlSchema,
   after_url: sanitizedBrowserUrlSchema,
-  event_sequence_start: z.number().int().min(1),
-  event_sequence_end: z.number().int().min(0),
+  event_sequence_start: z.int().min(1),
+  event_sequence_end: z.int().min(0),
   artifacts: browserStepArtifactsSchema,
   completeness: browserScenarioCompletenessSchema,
 };

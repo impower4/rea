@@ -68,11 +68,66 @@ it("preserves a UTF-8 BOM inside a CBOR text value rather than stripping it", ()
 });
 
 it.each([
+  [
+    "value",
+    "a1617860",
+    { kind: "text", value: "x" },
+    { kind: "text", value: "" },
+  ],
+  [
+    "key",
+    "a1606178",
+    { kind: "text", value: "" },
+    { kind: "text", value: "x" },
+  ],
+  [
+    "long-form value",
+    "a161787800",
+    { kind: "text", value: "x" },
+    { kind: "text", value: "" },
+  ],
+])(
+  "decodes an empty CBOR text %s like any other text",
+  (_name, hex, key, value) => {
+    expect(inspectSolidityMetadata(bytecode(hex))).toMatchObject({
+      status: "decoded",
+      entries: [{ key, value }],
+    });
+  },
+);
+
+it("keeps the compiler version beside a shortest-form empty text", () => {
+  const result = inspectSolidityMetadata(
+    bytecode("a264736f6c634300081e617860"),
+  );
+  expect(result).toMatchObject({
+    status: "decoded",
+    compiler_version: { representation: "release-bytes", value: "0.8.30" },
+  });
+  expect(result.entries).toHaveLength(2);
+});
+
+it("decodes distinct byte keys and distinct nested-container keys", () => {
+  expect(
+    inspectSolidityMetadata(bytecode("a2410101410202")).entries.map(
+      ({ key }) => key,
+    ),
+  ).toEqual([
+    { kind: "bytes", value: "01" },
+    { kind: "bytes", value: "02" },
+  ]);
+  expect(inspectSolidityMetadata(bytecode("a2810101810202"))).toMatchObject({
+    status: "partial",
+  });
+});
+
+it.each([
   ["invalid text", "a1617861ff"],
   ["truncated value", "a16178"],
   ["unsupported tag", "a16178c000"],
   ["floating point", "a16178fa3f800000"],
   ["duplicate key", "a2617801617802"],
+  ["duplicate byte key", "a2410101410102"],
   ["excessive nesting", "a16178" + "81".repeat(65) + "00"],
   ["impossible collection", "a161788a00"],
 ])("keeps exact ranges and unavailable interpretation for %s", (_name, hex) => {

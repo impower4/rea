@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
-import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { createTestTempDirectory } from "../../../tests/fixtures/temporaryDirectory.js";
+import * as processOutput from "../../process/ExecFileOutput.js";
 import { encodeNibArchiveFixture } from "./NibArchive.fixture.js";
+import type { analyzeInterfaceBuilderBundle } from "./InterfaceBuilderAnalysis.js";
 import { ArtifactReaderFailure } from "../ArtifactReader.js";
 import {
   analyzeAppleAssetCatalogs,
@@ -63,30 +65,42 @@ describe("Apple asset catalog application workflow", () => {
     ]);
   });
 
-  it("reports an app without compiled catalogs as an empty observed inventory", async () => {
-    const bundle = await createTestTempDirectory("rea-asset-catalog-absent-");
-    await mkdir(join(bundle, "Contents", "Resources"), { recursive: true });
-    await writeFile(join(bundle, "Contents", "Resources", "icon.icns"), "");
-    const result = await analyzeAppleAssetCatalogs({
-      environment: {},
-      bundlePath: bundle,
-      targetSha256: "a".repeat(64),
-      runAssetUtil: () => {
-        throw new Error("assetutil must not run without a catalog");
-      },
-    });
-    expect(result).toMatchObject({
-      catalogs: [],
-      total_records: 0,
-      records: [],
-      resource_key_matches: [],
-      next_offset: null,
-      truncated: false,
-    });
-    expect(result.limitations).toContain(
-      "No compiled Assets.car catalog was found among the app bundle's regular files (symlinks are not followed); any resource keys are reported as unmatched.",
-    );
-  });
+  it.each([0, 1, 5])(
+    "reports an app without compiled catalogs as empty at offset %i",
+    async (offset) => {
+      const bundle = await createTestTempDirectory("rea-asset-catalog-absent-");
+      await mkdir(join(bundle, "Contents", "Resources"), { recursive: true });
+      await writeFile(join(bundle, "Contents", "Resources", "icon.icns"), "");
+      // Names that merely end in Assets.car are ordinary resources.
+      await mkdir(join(bundle, "Contents", "Resources", "NotAssets.car"));
+      await writeFile(
+        join(bundle, "Contents", "Resources", "OldAssets.car"),
+        "",
+      );
+      const result = await analyzeAppleAssetCatalogs({
+        environment: {},
+        bundlePath: bundle,
+        targetSha256: "a".repeat(64),
+        page: { offset },
+        runAssetUtil: () => {
+          throw new Error("assetutil must not run without a catalog");
+        },
+      });
+      expect(result).toMatchObject({
+        catalogs: [],
+        total_records: 0,
+        offset,
+        limit: 1_000,
+        records: [],
+        resource_key_matches: [],
+        next_offset: null,
+        truncated: false,
+      });
+      expect(result.limitations).toContain(
+        "No compiled Assets.car catalog was found among the app bundle's regular files (symlinks are not followed); any resource keys are reported as unmatched.",
+      );
+    },
+  );
 
   it("does not report absence when the only catalog entry is a symlink", async () => {
     const bundle = await createTestTempDirectory("rea-asset-catalog-link-");
@@ -132,6 +146,31 @@ describe("Apple asset catalog application workflow", () => {
     );
   });
 });
+
+it.each([0, 1, 5])(
+  "keeps an empty assetutil inventory complete at offset %i",
+  async (offset) => {
+    const bundle = await createTestTempDirectory("rea-asset-catalog-empty-");
+    const resources = join(bundle, "Contents", "Resources");
+    await mkdir(resources, { recursive: true });
+    await writeFile(join(resources, "Assets.car"), "inert catalog fixture");
+    const result = await analyzeAppleAssetCatalogs({
+      environment: {},
+      bundlePath: bundle,
+      targetSha256: "a".repeat(64),
+      page: { offset, limit: 2 },
+      runAssetUtil: () => Promise.resolve("[]"),
+    });
+    expect(result).toMatchObject({
+      total_records: 0,
+      offset,
+      limit: 2,
+      records: [],
+      next_offset: null,
+      truncated: false,
+    });
+  },
+);
 
 it.each([1, 2])(
   "joins NIBArchive keys against %i supplied assetutil renditions",
@@ -205,4 +244,137 @@ it("keeps recognized image fields on NIBArchive controls out of resource joins",
     runAssetUtil: () => Promise.resolve(JSON.stringify([{ Name: "Toolbar" }])),
   });
   expect(result.resource_key_matches).toEqual([]);
+});
+
+describe("Apple asset catalog and Interface Builder concurrency", () => {
+  const catalogBundle = async () => {
+    const bundle = await createTestTempDirectory("rea-asset-catalog-ib-");
+    const resources = join(bundle, "Contents", "Resources");
+    await mkdir(resources, { recursive: true });
+    await writeFile(join(resources, "Assets.car"), "catalog");
+    return bundle;
+  };
+  const emptyGraph = {
+    graph: { nodes: [], truncated: false },
+  } as unknown as Awaited<ReturnType<typeof analyzeInterfaceBuilderBundle>>;
+
+  it("keeps the Interface Builder analysis running while catalogs are inspected", async () => {
+    // The Interface Builder analysis can finish only after catalog inspection
+    // starts, so a sequential implementation would never complete.
+    let catalogStarted!: () => void;
+    const catalogStart = new Promise<void>((resolve) => {
+      catalogStarted = resolve;
+    });
+    const result = await analyzeAppleAssetCatalogs({
+      environment: {},
+      bundlePath: await catalogBundle(),
+      targetSha256: "a".repeat(64),
+      analyzeInterfaceBuilder: async () => {
+        await catalogStart;
+        return emptyGraph;
+      },
+      runAssetUtil: async () => {
+        catalogStarted();
+        return "[]";
+      },
+    });
+    expect(result.catalogs).toHaveLength(1);
+  }, 5_000);
+
+  it("cancels the Interface Builder analysis and reports a catalog failure", async () => {
+    let cancelled = false;
+    let settled = false;
+    const rejected = await analyzeAppleAssetCatalogs({
+      environment: {},
+      bundlePath: await catalogBundle(),
+      targetSha256: "a".repeat(64),
+      analyzeInterfaceBuilder: ({ signal }) =>
+        new Promise((_, reject) => {
+          signal?.addEventListener("abort", () => {
+            cancelled = true;
+            setImmediate(() => {
+              settled = true;
+              reject(new Error("interface builder cancelled"));
+            });
+          });
+        }),
+      runAssetUtil: () => Promise.reject(new Error("assetutil failed")),
+    }).catch((cause: unknown) => cause);
+    expect(rejected).toMatchObject({ message: "assetutil failed" });
+    expect(cancelled).toBe(true);
+    expect(settled).toBe(true);
+  });
+
+  it("reports an early Interface Builder failure only after catalogs are inspected", async () => {
+    let finishCatalog!: (output: string) => void;
+    let catalogStarted = false;
+    let settled = false;
+    const analysis = analyzeAppleAssetCatalogs({
+      environment: {},
+      bundlePath: await catalogBundle(),
+      targetSha256: "a".repeat(64),
+      analyzeInterfaceBuilder: () =>
+        Promise.reject(new Error("interface builder failed")),
+      runAssetUtil: () => {
+        catalogStarted = true;
+        return new Promise((resolve) => {
+          finishCatalog = resolve;
+        });
+      },
+    }).finally(() => {
+      settled = true;
+    });
+    analysis.catch(() => undefined);
+    await vi.waitFor(() => expect(catalogStarted).toBe(true));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    finishCatalog("[]");
+    await expect(analysis).rejects.toThrow("interface builder failed");
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "settles a cancelled assetutil run only after its process exits",
+    async () => {
+      const bundle = await catalogBundle();
+      const work = await createTestTempDirectory("rea-assetutil-stop-");
+      const ready = join(work, "ready");
+      const exited = join(work, "exited");
+      const script = `const fs=require("node:fs");process.on("SIGTERM",()=>{setTimeout(()=>{fs.writeFileSync(process.argv[2],"exited");process.exit(0)},500)});fs.writeFileSync(process.argv[1],"ready");setInterval(()=>{},1000);`;
+      const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      const realExecFileOutput = processOutput.execFileOutput;
+      Object.defineProperty(process, "platform", {
+        ...platform,
+        value: "darwin",
+      });
+      const spy = vi
+        .spyOn(processOutput, "execFileOutput")
+        .mockImplementation((_command, _args, options) =>
+          realExecFileOutput(
+            process.execPath,
+            ["-e", script, ready, exited],
+            options,
+          ),
+        );
+      const controller = new AbortController();
+      let settled: Promise<unknown> | undefined;
+      try {
+        settled = analyzeAppleAssetCatalogs({
+          environment: {},
+          bundlePath: bundle,
+          targetSha256: "a".repeat(64),
+          signal: controller.signal,
+          analyzeInterfaceBuilder: async () => emptyGraph,
+        }).catch((cause: unknown) => cause);
+        await vi.waitFor(() => expect(access(ready)).resolves.toBeUndefined());
+        controller.abort("stop asset inspection");
+        expect(await settled).toMatchObject({ reason: "cancelled" });
+        await expect(access(exited)).resolves.toBeUndefined();
+      } finally {
+        controller.abort("stop asset inspection");
+        await settled;
+        spy.mockRestore();
+        Object.defineProperty(process, "platform", platform);
+      }
+    },
+  );
 });

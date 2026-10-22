@@ -7,6 +7,7 @@ import {
   buildManagedPeFixture,
   managedPeFixtureTarget,
 } from "./ManagedPe.fixture.js";
+import { parseExceptionRegions } from "./ManagedMemberInstructionDecoder.js";
 
 const managedBodyWithSections = (...sections: Buffer[]) => {
   const header = Buffer.alloc(12);
@@ -331,6 +332,90 @@ describe("managed operand extent diagnostics", () => {
       });
     },
   );
+});
+
+describe("managed CIL prefix completion", () => {
+  it.each([
+    ["unaligned.", [0xfe, 0x12, 1], 1],
+    ["volatile.", [0xfe, 0x13], 1],
+    ["tail.", [0xfe, 0x14], 1],
+    ["constrained.", [0xfe, 0x16, 1, 0, 0, 2], 1],
+    ["no.", [0xfe, 0x19, 4], 1],
+    ["readonly.", [0xfe, 0x1e], 1],
+    ["unaligned. volatile. chain", [0xfe, 0x12, 1, 0xfe, 0x13], 2],
+  ] as const)(
+    "retains decoded evidence but rejects a terminal %s prefix",
+    (_label, prefix, prefixCount) => {
+      const il = Buffer.from([0x00, ...prefix]);
+      const { body, coverage } = tinyBody([...il]);
+      expect(body).toMatchObject({
+        status: "malformed",
+        il_size: il.length,
+        il_sha256: createHash("sha256").update(il).digest("hex"),
+        normalized_il_sha256: null,
+        decoded_instruction_count: 1 + prefixCount,
+        opcode_counts: { nop: 1 },
+        issue: "CIL prefix chain at IL offset 1 has no following instruction",
+      });
+      expect(coverage.state).toBe("partial");
+    },
+  );
+
+  it.each([
+    [[0xfe], "Two-byte CIL opcode at IL offset 2 leaves method body"],
+    [[0x20], "Instruction ldc.i4 at IL offset 2 leaves method body"],
+    [[0xfe, 0xff], "Unsupported CIL opcode 0xfeff at IL offset 2"],
+  ] as const)(
+    "keeps the original failure after a prefix followed by %j",
+    (suffix, issue) => {
+      const { body } = tinyBody([0xfe, 0x13, ...suffix]);
+      expect(body).toMatchObject({
+        status: "malformed",
+        decoded_instruction_count: 1,
+        normalized_il_sha256: null,
+        issue,
+      });
+    },
+  );
+
+  it("locates a dangling prefix after a completed chain", () => {
+    const { body, coverage } = tinyBody([
+      0xfe, 0x12, 1, 0xfe, 0x13, 0x4a, 0xfe, 0x13,
+    ]);
+    expect(body).toMatchObject({
+      status: "malformed",
+      decoded_instruction_count: 4,
+      opcode_counts: { "unaligned.": 1, "volatile.": 2, "ldind.i4": 1 },
+      normalized_il_sha256: null,
+      issue: "CIL prefix chain at IL offset 6 has no following instruction",
+    });
+    expect(coverage.state).toBe("partial");
+  });
+
+  it("rejects a fat method ending in a prefix without a normalized fingerprint", () => {
+    expect(fatBody(Buffer.from([0xfe, 0x13]))).toMatchObject({
+      status: "malformed",
+      header_format: "fat",
+      il_size: 2,
+      decoded_instruction_count: 1,
+      opcode_counts: { "volatile.": 1 },
+      normalized_il_sha256: null,
+      issue: "CIL prefix chain at IL offset 0 has no following instruction",
+    });
+  });
+
+  it("keeps a completed prefix chain present with its fingerprint", () => {
+    const { body, coverage } = tinyBody([
+      0xfe, 0x12, 1, 0xfe, 0x13, 0x4a, 0x2a,
+    ]);
+    expect(body).toMatchObject({
+      status: "present",
+      decoded_instruction_count: 4,
+      normalized_il_sha256: expect.any(String),
+      issue: null,
+    });
+    expect(coverage.state).toBe("complete");
+  });
 });
 
 describe("managed complete operand decoding", () => {
@@ -666,6 +751,59 @@ describe("managed exception region flags and filters", () => {
 });
 
 describe("managed exception section decoding", () => {
+  it("reads legacy small EH DataSize without counting its header", () => {
+    const section = Buffer.alloc(16);
+    section[0] = 0x01;
+    section[1] = 12;
+
+    expect(managedBodyWithSections(section)).toMatchObject({
+      status: "present",
+      issue: null,
+      exception_regions: [expect.any(Object)],
+      normalized_il_sha256: expect.any(String),
+    });
+  });
+
+  it("advances a chained legacy section by its physical size", () => {
+    const legacy = Buffer.alloc(16);
+    legacy[0] = 0x81;
+    legacy[1] = 12;
+    const conformant = Buffer.alloc(16);
+    conformant[0] = 0x01;
+    conformant[1] = 16;
+
+    expect(managedBodyWithSections(legacy, conformant)).toMatchObject({
+      status: "present",
+      issue: null,
+      exception_regions: [expect.any(Object), expect.any(Object)],
+      normalized_il_sha256: expect.any(String),
+    });
+  });
+
+  it("rejects a legacy-sized clause whose physical bytes leave the artifact", () => {
+    const section = Buffer.alloc(12);
+    section[0] = 0x01;
+    section[1] = 12;
+
+    expect(parseExceptionRegions(section, 0, section.length)).toMatchObject({
+      status: "malformed",
+      regions: [],
+      issue: "Exception section size leaves artifact",
+    });
+  });
+
+  it("still rejects a small EH DataSize that matches neither layout", () => {
+    const section = Buffer.alloc(17);
+    section[0] = 0x01;
+    section[1] = 13;
+
+    expect(managedBodyWithSections(section)).toMatchObject({
+      status: "malformed",
+      exception_regions: [],
+      issue: "Exception section size does not contain whole clauses",
+    });
+  });
+
   it("marks an exception section with a partial clause as malformed", () => {
     const section = Buffer.alloc(17);
     section[0] = 0x01;
@@ -692,6 +830,19 @@ describe("managed exception section decoding", () => {
         { flags: 0, try_offset: 0, try_length: 0, handler_offset: 0 },
         { flags: 0, try_offset: 0, try_length: 0, handler_offset: 0 },
       ],
+    });
+  });
+
+  it("keeps small section reserved bytes invalid", () => {
+    const section = Buffer.alloc(16);
+    section[0] = 0x01;
+    section[1] = 16;
+    section[2] = 1;
+
+    expect(managedBodyWithSections(section)).toMatchObject({
+      status: "malformed",
+      exception_regions: [],
+      issue: "Small exception section reserved bytes are nonzero",
     });
   });
 

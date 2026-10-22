@@ -59,16 +59,16 @@ export const bundleComparisonResultSchema = z.object({
   left_bundle_sha256: digestSchema,
   right_bundle_sha256: digestSchema,
   summary: z.object({
-    records_unchanged: z.number().int().min(0),
-    records_added: z.number().int().min(0),
-    records_removed: z.number().int().min(0),
-    records_changed: z.number().int().min(0),
-    unknowns_unchanged: z.number().int().min(0),
-    unknowns_added: z.number().int().min(0),
-    unknowns_removed: z.number().int().min(0),
-    unknowns_advanced: z.number().int().min(0),
-    unknowns_diverged: z.number().int().min(0),
-    unresolved: z.number().int().min(0),
+    records_unchanged: z.int().min(0),
+    records_added: z.int().min(0),
+    records_removed: z.int().min(0),
+    records_changed: z.int().min(0),
+    unknowns_unchanged: z.int().min(0),
+    unknowns_added: z.int().min(0),
+    unknowns_removed: z.int().min(0),
+    unknowns_advanced: z.int().min(0),
+    unknowns_diverged: z.int().min(0),
+    unresolved: z.int().min(0),
   }),
   changes: z.array(bundleChangeSchema),
   limitations: z.array(z.string()),
@@ -102,11 +102,7 @@ export const compareBundles = (
   ).length;
   return bundleComparisonResultSchema.parse({
     status:
-      leftDigest === rightDigest && changes.length === 0
-        ? "unchanged"
-        : unresolved > 0
-          ? "unknown"
-          : "changed",
+      unresolved > 0 ? "unknown" : changes.length > 0 ? "changed" : "unchanged",
     left_bundle_sha256: leftDigest,
     right_bundle_sha256: rightDigest,
     summary: {
